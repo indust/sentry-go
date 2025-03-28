@@ -149,9 +149,7 @@ func extractXErrorsPC(err error) []uintptr {
 	//nolint: errcheck
 	defer func() { recover() }()
 
-	field := reflect.ValueOf(err).Elem().FieldByName("frame") // type Frame struct{ frames [3]uintptr }
-	field = field.FieldByName("frames")
-	field = field.Slice(1, field.Len()) // drop first pc pointing to xerrors.New
+	field := reflect.ValueOf(err).Elem().FieldByName("stack") // [3]uintptr
 	pc := make([]uintptr, field.Len())
 	for i := 0; i < field.Len(); i++ {
 		pc[i] = uintptr(field.Index(i).Uint())
