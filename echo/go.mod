@@ -1,11 +1,11 @@
 module github.com/getsentry/sentry-go/echo
 
-go 1.21
+go 1.22
 
 replace github.com/getsentry/sentry-go => ../
 
 require (
-	github.com/getsentry/sentry-go v0.31.1
+	github.com/getsentry/sentry-go v0.35.1
 	github.com/google/go-cmp v0.5.9
 	github.com/labstack/echo/v4 v4.10.0
 )

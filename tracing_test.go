@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -138,15 +139,12 @@ func TestStartSpan(t *testing.T) {
 				SpanID:       span.SpanID,
 				ParentSpanID: parentSpanID,
 				Op:           op,
+				Data:         span.Data,
 				Description:  description,
 				Status:       status,
 			}.Map(),
 		},
-		Tags: nil,
-		// TODO(tracing): the root span / transaction data field is
-		// mapped into Event.Extra for now, pending spec clarification.
-		// https://github.com/getsentry/develop/issues/244#issuecomment-778694182
-		Extra:     span.Data,
+		Tags:      nil,
 		Timestamp: endTime,
 		StartTime: startTime,
 		TransactionInfo: &TransactionInfo{
@@ -283,16 +281,13 @@ func TestStartTransaction(t *testing.T) {
 			"trace": TraceContext{
 				TraceID:     transaction.TraceID,
 				SpanID:      transaction.SpanID,
+				Data:        transaction.Data,
 				Description: description,
 				Status:      status,
 			}.Map(),
 			"otel": {"k": "v"},
 		},
-		Tags: nil,
-		// TODO(tracing): the root span / transaction data field is
-		// mapped into Event.Extra for now, pending spec clarification.
-		// https://github.com/getsentry/develop/issues/244#issuecomment-778694182
-		Extra:     transaction.Data,
+		Tags:      nil,
 		Timestamp: endTime,
 		StartTime: startTime,
 		TransactionInfo: &TransactionInfo{
@@ -513,13 +508,14 @@ func TestContinueSpanFromRequest(t *testing.T) {
 
 func TestContinueTransactionFromHeaders(t *testing.T) {
 	tests := []struct {
+		name       string
 		traceStr   string
 		baggageStr string
 		// Using a pointer to Span so we don't implicitly copy Span.mu mutex
 		wantSpan *Span
 	}{
 		{
-			// No sentry-trace or baggage => nothing to do, unfrozen DSC
+			name:       "No sentry-trace or baggage => nothing to do, unfrozen DSC",
 			traceStr:   "",
 			baggageStr: "",
 			wantSpan: &Span{
@@ -531,20 +527,19 @@ func TestContinueTransactionFromHeaders(t *testing.T) {
 			},
 		},
 		{
-			// Third-party baggage => nothing to do, unfrozen DSC
+			name:       "baggage => nothing to do, unfrozen DSC",
 			traceStr:   "",
 			baggageStr: "other-vendor-key1=value1;value2, other-vendor-key2=value3",
 			wantSpan: &Span{
 				Sampled: 0,
 				dynamicSamplingContext: DynamicSamplingContext{
 					Frozen:  false,
-					Entries: map[string]string{},
+					Entries: nil,
 				},
 			},
 		},
 		{
-			// sentry-trace and no baggage => we should create a new DSC and freeze it
-			// immediately.
+			name:       "sentry-trace and no baggage => we should create a new DSC and freeze it",
 			traceStr:   "bc6d53f15eb88f4320054569b8c553d4-b72fa28504b07285-1",
 			baggageStr: "",
 			wantSpan: &Span{
@@ -557,7 +552,7 @@ func TestContinueTransactionFromHeaders(t *testing.T) {
 			},
 		},
 		{
-			// sentry-trace and baggage with Sentry values => we freeze immediately.
+			name:       "sentry-trace and baggage with Sentry values => we freeze immediately.",
 			traceStr:   "bc6d53f15eb88f4320054569b8c553d4-b72fa28504b07285-1",
 			baggageStr: "sentry-trace_id=d49d9bf66f13450b81f65bc51cf49c03,sentry-public_key=public,sentry-sample_rate=1",
 			wantSpan: &Span{
@@ -574,14 +569,32 @@ func TestContinueTransactionFromHeaders(t *testing.T) {
 				},
 			},
 		},
+		{
+			name:       "no sentry-trace and baggage with Sentry values => unfrozen DSC",
+			baggageStr: "sentry-trace_id=d49d9bf66f13450b81f65bc51cf49c03,sentry-public_key=public,sentry-sample_rate=1",
+			wantSpan: &Span{
+				Sampled: 0,
+				dynamicSamplingContext: DynamicSamplingContext{
+					Frozen:  false,
+					Entries: nil,
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
-		s := &Span{}
-		spanOption := ContinueFromHeaders(tt.traceStr, tt.baggageStr)
-		spanOption(s)
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Span{}
+			spanOption := ContinueFromHeaders(tt.traceStr, tt.baggageStr)
+			spanOption(s)
 
-		assertEqual(t, s, tt.wantSpan)
+			if diff := cmp.Diff(tt.wantSpan, s, cmp.Options{
+				cmp.AllowUnexported(Span{}),
+				cmpopts.IgnoreFields(Span{}, "mu", "finishOnce"),
+			}); diff != "" {
+				t.Fatalf("Expected no difference on spans, got: %s", diff)
+			}
+		})
 	}
 }
 
@@ -684,7 +697,7 @@ func TestSample(t *testing.T) {
 		TracesSampleRate: 0.0,
 	})
 	span = StartSpan(ctx, "op", WithTransactionName("name"), WithSpanSampled(SampledTrue))
-	if got := span.Sampled; got != SampledTrue {
+	if got := span.explicitSampled; got != SampledTrue {
 		t.Fatalf("got %s, want %s", got, SampledTrue)
 	}
 
@@ -719,6 +732,193 @@ func TestSample(t *testing.T) {
 	span = StartSpan(ctx, "op", WithTransactionName("name"))
 	if got := span.Sampled; got != SampledTrue {
 		t.Fatalf("got %s, want %s", got, SampledTrue)
+	}
+}
+
+func TestSampleRatePropagation(t *testing.T) {
+	tests := []struct {
+		name                   string
+		clientOptions          ClientOptions
+		traceHeader            string
+		baggageHeader          string
+		expectedRate           float64
+		expectedBaggageEntries []string
+	}{
+		{
+			name: "Tracing disabled",
+			clientOptions: ClientOptions{
+				EnableTracing: false,
+			},
+			traceHeader:            "423d7a0fb16128c8503f067d8447caba-d9246d56c61fc963-1",
+			baggageHeader:          "sentry-trace_id=423d7a0fb16128c8503f067d8447caba,sentry-sampled=true,sentry-sample_rate=1",
+			expectedRate:           0.0,
+			expectedBaggageEntries: nil,
+		},
+		{
+			name: "Inherit from parent - sampled flag = 1",
+			clientOptions: ClientOptions{
+				EnableTracing: true,
+			},
+			traceHeader:   "423d7a0fb16128c8503f067d8447caba-d9246d56c61fc963-1",
+			baggageHeader: "sentry-trace_id=423d7a0fb16128c8503f067d8447caba,sentry-sampled=true,sentry-sample_rate=1",
+			expectedRate:  1.0,
+			expectedBaggageEntries: []string{
+				"sentry-sampled=true",
+				"sentry-trace_id=423d7a0fb16128c8503f067d8447caba",
+				"sentry-sample_rate=1",
+			},
+		},
+		{
+			name: "Inherit from parent - sampled flag = 0",
+			clientOptions: ClientOptions{
+				EnableTracing: true,
+			},
+			traceHeader:   "423d7a0fb16128c8503f067d8447caba-d9246d56c61fc963-0",
+			baggageHeader: "sentry-trace_id=423d7a0fb16128c8503f067d8447caba,sentry-sampled=false,sentry-sample_rate=0.0",
+			expectedRate:  0.0,
+			expectedBaggageEntries: []string{
+				"sentry-sampled=false",
+				"sentry-trace_id=423d7a0fb16128c8503f067d8447caba",
+				"sentry-sample_rate=0",
+			},
+		},
+		{
+			name: "Inherit from parent - defer sampled flag",
+			clientOptions: ClientOptions{
+				EnableTracing: true,
+			},
+			traceHeader:   "423d7a0fb16128c8503f067d8447caba-d9246d56c61fc963",
+			baggageHeader: "sentry-trace_id=423d7a0fb16128c8503f067d8447caba",
+			expectedRate:  0.0,
+			expectedBaggageEntries: []string{
+				"sentry-trace_id=423d7a0fb16128c8503f067d8447caba",
+				"sentry-sample_rate=0",
+			},
+		},
+		{
+			name: "TracesSampler with sampled flag = 1",
+			clientOptions: ClientOptions{
+				EnableTracing: true,
+				TracesSampler: func(_ SamplingContext) float64 {
+					return 0.8
+				},
+			},
+			traceHeader:   "423d7a0fb16128c8503f067d8447caba-d9246d56c61fc963-1",
+			baggageHeader: "sentry-trace_id=423d7a0fb16128c8503f067d8447caba,sentry-sampled=true,sentry-sample_rate=1",
+			expectedRate:  0.8,
+			expectedBaggageEntries: []string{
+				"sentry-sampled=true",
+				"sentry-trace_id=423d7a0fb16128c8503f067d8447caba",
+				"sentry-sample_rate=0.8",
+			},
+		},
+		{
+			name: "TracesSampler with sampled flag = 0",
+			clientOptions: ClientOptions{
+				EnableTracing: true,
+				TracesSampler: func(_ SamplingContext) float64 {
+					return 0.8
+				},
+			},
+			traceHeader:   "423d7a0fb16128c8503f067d8447caba-d9246d56c61fc963-0",
+			baggageHeader: "sentry-trace_id=423d7a0fb16128c8503f067d8447caba,sentry-sampled=false,sentry-sample_rate=0.0",
+			expectedRate:  0.8,
+			expectedBaggageEntries: []string{
+				"sentry-sampled=false",
+				"sentry-trace_id=423d7a0fb16128c8503f067d8447caba",
+				"sentry-sample_rate=0.8",
+			},
+		},
+		{
+			name: "TracesSampler - defer sampled flag",
+			clientOptions: ClientOptions{
+				EnableTracing: true,
+				TracesSampler: func(_ SamplingContext) float64 {
+					return 0.8
+				},
+			},
+			traceHeader:   "423d7a0fb16128c8503f067d8447caba-d9246d56c61fc963",
+			baggageHeader: "sentry-trace_id=423d7a0fb16128c8503f067d8447caba",
+			expectedRate:  0.8,
+			expectedBaggageEntries: []string{
+				"sentry-trace_id=423d7a0fb16128c8503f067d8447caba",
+				"sentry-sample_rate=0.8",
+			},
+		},
+		{
+			name: "TracesSampleRate with sampled flag = 1",
+			clientOptions: ClientOptions{
+				EnableTracing:    true,
+				TracesSampleRate: 0.4,
+			},
+			traceHeader:   "423d7a0fb16128c8503f067d8447caba-d9246d56c61fc963-1",
+			baggageHeader: "sentry-trace_id=423d7a0fb16128c8503f067d8447caba,sentry-sampled=true,sentry-sample_rate=1",
+			expectedRate:  1.0,
+			expectedBaggageEntries: []string{
+				"sentry-sampled=true",
+				"sentry-trace_id=423d7a0fb16128c8503f067d8447caba",
+				"sentry-sample_rate=1",
+			},
+		},
+		{
+			name: "TracesSampleRate with sampled flag = 0",
+			clientOptions: ClientOptions{
+				EnableTracing:    true,
+				TracesSampleRate: 0.4,
+			},
+			traceHeader:   "423d7a0fb16128c8503f067d8447caba-d9246d56c61fc963-0",
+			baggageHeader: "sentry-trace_id=423d7a0fb16128c8503f067d8447caba,sentry-sampled=false,sentry-sample_rate=0.0",
+			expectedRate:  0.0,
+			expectedBaggageEntries: []string{
+				"sentry-sampled=false",
+				"sentry-trace_id=423d7a0fb16128c8503f067d8447caba",
+				"sentry-sample_rate=0",
+			},
+		},
+		{
+			name: "TracesSampleRate - defer sampled flag",
+			clientOptions: ClientOptions{
+				EnableTracing:    true,
+				TracesSampleRate: 0.4,
+			},
+			traceHeader:   "423d7a0fb16128c8503f067d8447caba-d9246d56c61fc963",
+			baggageHeader: "sentry-trace_id=423d7a0fb16128c8503f067d8447caba",
+			expectedRate:  0.4,
+			expectedBaggageEntries: []string{
+				"sentry-trace_id=423d7a0fb16128c8503f067d8447caba",
+				"sentry-sample_rate=0.4",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			transport := &MockTransport{}
+			ctx := NewTestContext(ClientOptions{
+				EnableTracing:    tt.clientOptions.EnableTracing,
+				TracesSampler:    tt.clientOptions.TracesSampler,
+				TracesSampleRate: tt.clientOptions.TracesSampleRate,
+				Transport:        transport,
+			})
+
+			hub := GetHubFromContext(ctx)
+			options := []SpanOption{
+				ContinueTrace(hub, tt.traceHeader, tt.baggageHeader),
+			}
+			transaction := StartTransaction(ctx, "test-transaction", options...)
+			transaction.Finish()
+
+			baggage := transaction.ToBaggage()
+			for _, header := range tt.expectedBaggageEntries {
+				if !strings.Contains(baggage, header) {
+					t.Errorf("Expected baggage header to contain %q, got %q", header, baggage)
+				}
+			}
+
+			if transaction.sampleRate != tt.expectedRate {
+				t.Errorf("Expected sample rate %f, got %f", tt.expectedRate, transaction.sampleRate)
+			}
+		})
 	}
 }
 

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -634,7 +636,7 @@ func TestIgnoreErrors(t *testing.T) {
 			client.CaptureMessage(tt.message, nil, scope)
 
 			dropped := transport.lastEvent == nil
-			if !(tt.expectDrop == dropped) {
+			if tt.expectDrop != dropped {
 				t.Errorf("expected event to be dropped")
 			}
 		})
@@ -690,7 +692,7 @@ func TestIgnoreTransactions(t *testing.T) {
 			transaction.Finish()
 
 			dropped := transport.lastEvent == nil
-			if !(tt.expectDrop == dropped) {
+			if tt.expectDrop != dropped {
 				t.Errorf("expected event to be dropped")
 			}
 		})
@@ -871,8 +873,18 @@ func TestSDKIdentifier(t *testing.T) {
 }
 
 func TestClientSetsUpTransport(t *testing.T) {
-	client, _ := NewClient(ClientOptions{Dsn: testDsn})
-	require.IsType(t, &HTTPTransport{}, client.Transport)
+	client, _ := NewClient(ClientOptions{
+		Dsn: testDsn,
+		HTTPClient: &http.Client{
+			Transport: &http.Transport{
+				DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+					return nil, fmt.Errorf("mock transport - no real connections")
+				},
+			},
+		},
+		Transport: &MockTransport{},
+	})
+	require.IsType(t, &MockTransport{}, client.Transport)
 
 	client, _ = NewClient(ClientOptions{})
 	require.IsType(t, &noopTransport{}, client.Transport)

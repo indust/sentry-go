@@ -4,7 +4,10 @@ import (
 	"encoding"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/getsentry/sentry-go"
 )
@@ -73,6 +76,8 @@ func attrToSentryEvent(attr slog.Attr, event *sentry.Event) {
 		handleUserAttributes(v, event)
 	case k == "request" && kind == slog.KindAny:
 		handleRequestAttributes(v, event)
+	case k == "fingerprint" && kind == slog.KindAny:
+		handleFingerprint(v, event)
 	case kind == slog.KindGroup:
 		event.Extra[k] = attrsToMap(v.Group()...)
 	default:
@@ -120,4 +125,52 @@ func handleRequestAttributes(v slog.Value, event *sentry.Event) {
 			}
 		}
 	}
+}
+
+func handleFingerprint(v slog.Value, event *sentry.Event) {
+	if fingerprint, ok := v.Any().([]string); ok {
+		event.Fingerprint = fingerprint
+	}
+}
+
+func slogAttrToLogEntry(logEntry sentry.LogEntry, group string, a slog.Attr) sentry.LogEntry {
+	key := group + a.Key
+	switch a.Value.Kind() {
+	case slog.KindAny:
+		return logEntry.String(key, fmt.Sprintf("%+v", a.Value.Any()))
+	case slog.KindBool:
+		return logEntry.Bool(key, a.Value.Bool())
+	case slog.KindDuration:
+		return logEntry.String(key, a.Value.Duration().String())
+	case slog.KindFloat64:
+		return logEntry.Float64(key, a.Value.Float64())
+	case slog.KindInt64:
+		return logEntry.Int64(key, a.Value.Int64())
+	case slog.KindString:
+		return logEntry.String(key, a.Value.String())
+	case slog.KindTime:
+		return logEntry.String(key, a.Value.Time().Format(time.RFC3339))
+	case slog.KindUint64:
+		val := a.Value.Uint64()
+		if val <= math.MaxInt64 {
+			return logEntry.Int64(key, int64(val))
+		} else {
+			return logEntry.String(key, strconv.FormatUint(val, 10))
+		}
+	case slog.KindLogValuer:
+		return logEntry.String(key, a.Value.LogValuer().LogValue().String())
+	case slog.KindGroup:
+		// Handle nested group attributes
+		groupPrefix := key
+		if groupPrefix != "" {
+			groupPrefix += "."
+		}
+		for _, subAttr := range a.Value.Group() {
+			logEntry = slogAttrToLogEntry(logEntry, groupPrefix, subAttr)
+		}
+		return logEntry
+	}
+
+	sentry.DebugLogger.Printf("Invalid type: dropping attribute with key: %v and value: %v", a.Key, a.Value)
+	return logEntry
 }
