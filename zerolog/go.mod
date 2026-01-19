@@ -1,12 +1,12 @@
 module github.com/getsentry/sentry-go/zerolog
 
-go 1.22
+go 1.23.0
 
 replace github.com/getsentry/sentry-go => ../
 
 require (
 	github.com/buger/jsonparser v1.1.1
-	github.com/getsentry/sentry-go v0.35.1
+	github.com/getsentry/sentry-go v0.41.0
 	github.com/rs/zerolog v1.33.0
 	github.com/stretchr/testify v1.9.0
 )

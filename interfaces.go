@@ -3,16 +3,15 @@ package sentry
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
-	"reflect"
-	"slices"
 	"strings"
 	"time"
 
 	"github.com/getsentry/sentry-go/attribute"
+	"github.com/getsentry/sentry-go/internal/protocol"
+	"github.com/getsentry/sentry-go/internal/ratelimit"
 )
 
 const eventType = "event"
@@ -40,18 +39,8 @@ const (
 )
 
 // SdkInfo contains all metadata about the SDK.
-type SdkInfo struct {
-	Name         string       `json:"name,omitempty"`
-	Version      string       `json:"version,omitempty"`
-	Integrations []string     `json:"integrations,omitempty"`
-	Packages     []SdkPackage `json:"packages,omitempty"`
-}
-
-// SdkPackage describes a package that was installed.
-type SdkPackage struct {
-	Name    string `json:"name,omitempty"`
-	Version string `json:"version,omitempty"`
-}
+type SdkInfo = protocol.SdkInfo
+type SdkPackage = protocol.SdkPackage
 
 // TODO: This type could be more useful, as map of interface{} is too generic
 // and requires a lot of type assertions in beforeBreadcrumb calls
@@ -91,7 +80,7 @@ func (b *Breadcrumb) MarshalJSON() ([]byte, error) {
 
 	if b.Timestamp.IsZero() {
 		return json.Marshal(struct {
-			// Embed all of the fields of Breadcrumb.
+			// Embed all the fields of Breadcrumb.
 			*breadcrumb
 			// Timestamp shadows the original Timestamp field and is meant to
 			// remain nil, triggering the omitempty behavior.
@@ -248,11 +237,11 @@ var sensitiveHeaders = map[string]struct{}{
 // NewRequest avoids operations that depend on network access. In particular, it
 // does not read r.Body.
 func NewRequest(r *http.Request) *Request {
-	protocol := schemeHTTP
+	prot := protocol.SchemeHTTP
 	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
-		protocol = schemeHTTPS
+		prot = protocol.SchemeHTTPS
 	}
-	url := fmt.Sprintf("%s://%s%s", protocol, r.Host, r.URL.Path)
+	url := fmt.Sprintf("%s://%s%s", prot, r.Host, r.URL.Path)
 
 	var cookies string
 	var env map[string]string
@@ -295,7 +284,7 @@ func NewRequest(r *http.Request) *Request {
 
 // Mechanism is the mechanism by which an exception was generated and handled.
 type Mechanism struct {
-	Type             string         `json:"type,omitempty"`
+	Type             string         `json:"type"`
 	Description      string         `json:"description,omitempty"`
 	HelpLink         string         `json:"help_link,omitempty"`
 	Source           string         `json:"source,omitempty"`
@@ -424,64 +413,148 @@ func (e *Event) SetException(exception error, maxErrorDepth int) {
 		return
 	}
 
-	err := exception
-
-	for i := 0; err != nil && (i < maxErrorDepth || maxErrorDepth == -1); i++ {
-		// Add the current error to the exception slice with its details
-		e.Exception = append(e.Exception, Exception{
-			Value:      err.Error(),
-			Type:       reflect.TypeOf(err).String(),
-			Stacktrace: ExtractStacktrace(err),
-		})
-
-		// Attempt to unwrap the error using the standard library's Unwrap method.
-		// If errors.Unwrap returns nil, it means either there is no error to unwrap,
-		// or the error does not implement the Unwrap method.
-		unwrappedErr := errors.Unwrap(err)
-
-		if unwrappedErr != nil {
-			// The error was successfully unwrapped using the standard library's Unwrap method.
-			err = unwrappedErr
-			continue
-		}
-
-		cause, ok := err.(interface{ Cause() error })
-		if !ok {
-			// We cannot unwrap the error further.
-			break
-		}
-
-		// The error implements the Cause method, indicating it may have been wrapped
-		// using the github.com/pkg/errors package.
-		err = cause.Cause()
-	}
-
-	// Add a trace of the current stack to the most recent error in a chain if
-	// it doesn't have a stack trace yet.
-	// We only add to the most recent error to avoid duplication and because the
-	// current stack is most likely unrelated to errors deeper in the chain.
-	if e.Exception[0].Stacktrace == nil {
-		e.Exception[0].Stacktrace = NewStacktrace()
-	}
-
-	if len(e.Exception) <= 1 {
+	exceptions := convertErrorToExceptions(exception, maxErrorDepth)
+	if len(exceptions) == 0 {
 		return
 	}
 
-	// event.Exception should be sorted such that the most recent error is last.
-	slices.Reverse(e.Exception)
+	e.Exception = exceptions
+}
 
-	for i := range e.Exception {
-		e.Exception[i].Mechanism = &Mechanism{
-			IsExceptionGroup: true,
-			ExceptionID:      i,
-			Type:             "generic",
+// ToEnvelope converts the Event to a Sentry envelope.
+// This includes the event data and any attachments as separate envelope items.
+func (e *Event) ToEnvelope(dsn *protocol.Dsn) (*protocol.Envelope, error) {
+	return e.ToEnvelopeWithTime(dsn, time.Now())
+}
+
+// ToEnvelopeWithTime converts the Event to a Sentry envelope with a specific sentAt time.
+// This is primarily useful for testing with predictable timestamps.
+func (e *Event) ToEnvelopeWithTime(dsn *protocol.Dsn, sentAt time.Time) (*protocol.Envelope, error) {
+	// Create envelope header with trace context
+	trace := make(map[string]string)
+	if dsc := e.sdkMetaData.dsc; dsc.HasEntries() {
+		for k, v := range dsc.Entries {
+			trace[k] = v
 		}
-		if i == 0 {
-			continue
-		}
-		e.Exception[i].Mechanism.ParentID = Pointer(i - 1)
 	}
+
+	header := &protocol.EnvelopeHeader{
+		EventID: string(e.EventID),
+		SentAt:  sentAt,
+		Trace:   trace,
+	}
+
+	if dsn != nil {
+		header.Dsn = dsn.String()
+	}
+
+	header.Sdk = &e.Sdk
+
+	envelope := protocol.NewEnvelope(header)
+
+	eventBody, err := json.Marshal(e)
+	if err != nil {
+		// Try fallback: remove problematic fields and retry
+		e.Breadcrumbs = nil
+		e.Contexts = nil
+		e.Extra = map[string]interface{}{
+			"info": fmt.Sprintf("Could not encode original event as JSON. "+
+				"Succeeded by removing Breadcrumbs, Contexts and Extra. "+
+				"Please verify the data you attach to the scope. "+
+				"Error: %s", err),
+		}
+
+		eventBody, err = json.Marshal(e)
+		if err != nil {
+			return nil, fmt.Errorf("event could not be marshaled even with fallback: %w", err)
+		}
+
+		DebugLogger.Printf("Event marshaling succeeded with fallback after removing problematic fields")
+	}
+
+	var mainItem *protocol.EnvelopeItem
+	switch e.Type {
+	case transactionType:
+		mainItem = protocol.NewEnvelopeItem(protocol.EnvelopeItemTypeTransaction, eventBody)
+	case checkInType:
+		mainItem = protocol.NewEnvelopeItem(protocol.EnvelopeItemTypeCheckIn, eventBody)
+	case logEvent.Type:
+		mainItem = protocol.NewLogItem(len(e.Logs), eventBody)
+	default:
+		mainItem = protocol.NewEnvelopeItem(protocol.EnvelopeItemTypeEvent, eventBody)
+	}
+
+	envelope.AddItem(mainItem)
+	for _, attachment := range e.Attachments {
+		attachmentItem := protocol.NewAttachmentItem(attachment.Filename, attachment.ContentType, attachment.Payload)
+		envelope.AddItem(attachmentItem)
+	}
+
+	return envelope, nil
+}
+
+// ToEnvelopeItem converts the Event to a Sentry envelope item.
+func (e *Event) ToEnvelopeItem() (*protocol.EnvelopeItem, error) {
+	eventBody, err := json.Marshal(e)
+	if err != nil {
+		// Try fallback: remove problematic fields and retry
+		e.Breadcrumbs = nil
+		e.Contexts = nil
+		e.Extra = map[string]interface{}{
+			"info": fmt.Sprintf("Could not encode original event as JSON. "+
+				"Succeeded by removing Breadcrumbs, Contexts and Extra. "+
+				"Please verify the data you attach to the scope. "+
+				"Error: %s", err),
+		}
+
+		eventBody, err = json.Marshal(e)
+		if err != nil {
+			return nil, fmt.Errorf("event could not be marshaled even with fallback: %w", err)
+		}
+
+		DebugLogger.Printf("Event marshaling succeeded with fallback after removing problematic fields")
+	}
+
+	// TODO: all event types should be abstracted to implement EnvelopeItemConvertible and convert themselves.
+	var item *protocol.EnvelopeItem
+	switch e.Type {
+	case transactionType:
+		item = protocol.NewEnvelopeItem(protocol.EnvelopeItemTypeTransaction, eventBody)
+	case checkInType:
+		item = protocol.NewEnvelopeItem(protocol.EnvelopeItemTypeCheckIn, eventBody)
+	case logEvent.Type:
+		item = protocol.NewLogItem(len(e.Logs), eventBody)
+	default:
+		item = protocol.NewEnvelopeItem(protocol.EnvelopeItemTypeEvent, eventBody)
+	}
+
+	return item, nil
+}
+
+// GetCategory returns the rate limit category for this event.
+func (e *Event) GetCategory() ratelimit.Category {
+	return e.toCategory()
+}
+
+// GetEventID returns the event ID.
+func (e *Event) GetEventID() string {
+	return string(e.EventID)
+}
+
+// GetSdkInfo returns SDK information for the envelope header.
+func (e *Event) GetSdkInfo() *protocol.SdkInfo {
+	return &e.Sdk
+}
+
+// GetDynamicSamplingContext returns trace context for the envelope header.
+func (e *Event) GetDynamicSamplingContext() map[string]string {
+	trace := make(map[string]string)
+	if dsc := e.sdkMetaData.dsc; dsc.HasEntries() {
+		for k, v := range dsc.Entries {
+			trace[k] = v
+		}
+	}
+	return trace
 }
 
 // TODO: Event.Contexts map[string]interface{} => map[string]EventContext,
@@ -604,6 +677,21 @@ func (e *Event) checkInMarshalJSON() ([]byte, error) {
 	return json.Marshal(checkIn)
 }
 
+func (e *Event) toCategory() ratelimit.Category {
+	switch e.Type {
+	case "":
+		return ratelimit.CategoryError
+	case transactionType:
+		return ratelimit.CategoryTransaction
+	case logEvent.Type:
+		return ratelimit.CategoryLog
+	case checkInType:
+		return ratelimit.CategoryMonitor
+	default:
+		return ratelimit.CategoryUnknown
+	}
+}
+
 // NewEvent creates a new Event.
 func NewEvent() *Event {
 	return &Event{
@@ -635,12 +723,48 @@ type EventHint struct {
 }
 
 type Log struct {
-	Timestamp  time.Time            `json:"timestamp,omitempty"`
-	TraceID    TraceID              `json:"trace_id,omitempty"`
+	Timestamp  time.Time            `json:"timestamp"`
+	TraceID    TraceID              `json:"trace_id"`
+	SpanID     SpanID               `json:"span_id,omitempty"`
 	Level      LogLevel             `json:"level"`
 	Severity   int                  `json:"severity_number,omitempty"`
-	Body       string               `json:"body,omitempty"`
+	Body       string               `json:"body"`
 	Attributes map[string]Attribute `json:"attributes,omitempty"`
+}
+
+// ToEnvelopeItem converts the Log to a Sentry envelope item for batching.
+func (l *Log) ToEnvelopeItem() (*protocol.EnvelopeItem, error) {
+	logData, err := json.Marshal(l)
+	if err != nil {
+		return nil, err
+	}
+
+	return &protocol.EnvelopeItem{
+		Header: &protocol.EnvelopeItemHeader{
+			Type: protocol.EnvelopeItemTypeLog,
+		},
+		Payload: logData,
+	}, nil
+}
+
+// GetCategory returns the rate limit category for logs.
+func (l *Log) GetCategory() ratelimit.Category {
+	return ratelimit.CategoryLog
+}
+
+// GetEventID returns empty string (event ID set when batching).
+func (l *Log) GetEventID() string {
+	return ""
+}
+
+// GetSdkInfo returns nil (SDK info set when batching).
+func (l *Log) GetSdkInfo() *protocol.SdkInfo {
+	return nil
+}
+
+// GetDynamicSamplingContext returns nil (trace context set when batching).
+func (l *Log) GetDynamicSamplingContext() map[string]string {
+	return nil
 }
 
 type AttrType string
@@ -656,4 +780,33 @@ const (
 type Attribute struct {
 	Value any      `json:"value"`
 	Type  AttrType `json:"type"`
+}
+
+// MarshalJSON is a custom implementation that skips SpanID and timestamp when empty.
+func (l *Log) MarshalJSON() ([]byte, error) {
+	type log Log
+
+	var spanID string
+	if l.SpanID != zeroSpanID {
+		spanID = l.SpanID.String()
+	}
+
+	var ts json.RawMessage
+	if !l.Timestamp.IsZero() {
+		b, err := l.Timestamp.MarshalJSON()
+		if err != nil {
+			return nil, err
+		}
+		ts = b
+	}
+
+	return json.Marshal(struct {
+		*log
+		SpanID    string          `json:"span_id,omitempty"`
+		Timestamp json.RawMessage `json:"timestamp,omitempty"`
+	}{
+		log:       (*log)(l),
+		SpanID:    spanID,
+		Timestamp: ts,
+	})
 }

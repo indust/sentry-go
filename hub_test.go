@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/getsentry/sentry-go/internal/protocol"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 )
@@ -177,9 +178,9 @@ func TestConfigureScope(t *testing.T) {
 }
 
 func TestLastEventID(t *testing.T) {
-	uuid := EventID(uuid())
-	hub := &Hub{lastEventID: uuid}
-	assertEqual(t, uuid, hub.LastEventID())
+	eventID := EventID(protocol.GenerateEventID())
+	hub := &Hub{lastEventID: eventID}
+	assertEqual(t, eventID, hub.LastEventID())
 }
 
 func TestLastEventIDUpdatesAfterCaptures(t *testing.T) {
@@ -245,19 +246,6 @@ func TestAddBreadcrumbSkipAllBreadcrumbsIfMaxBreadcrumbsIsLessThanZero(t *testin
 	hub.AddBreadcrumb(breadcrumb, nil)
 
 	assertEqual(t, len(scope.breadcrumbs), 0)
-}
-
-func TestAddBreadcrumbShouldNeverExceedMaxBreadcrumbsConst(t *testing.T) {
-	hub, client, scope := setupHubTest()
-	client.options.MaxBreadcrumbs = 1000
-
-	breadcrumb := &Breadcrumb{Message: "Breadcrumb"}
-
-	for i := 0; i < 111; i++ {
-		hub.AddBreadcrumb(breadcrumb, nil)
-	}
-
-	assertEqual(t, len(scope.breadcrumbs), 100)
 }
 
 func TestAddBreadcrumbShouldWorkWithoutClient(t *testing.T) {

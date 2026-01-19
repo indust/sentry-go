@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/getsentry/sentry-go/attribute"
+	"github.com/getsentry/sentry-go/internal/debuglog"
 	"github.com/getsentry/sentry-go/internal/testutils"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -542,13 +543,22 @@ func Test_batchLogger_FlushMultipleTimes(t *testing.T) {
 }
 
 func Test_batchLogger_Shutdown(t *testing.T) {
-	ctx, mockTransport := setupMockTransport()
+	mockTransport := &MockTransport{}
+	mockClient, _ := NewClient(ClientOptions{
+		Dsn:                    testDsn,
+		Transport:              mockTransport,
+		EnableLogs:             true,
+		DisableTelemetryBuffer: true,
+	})
+	hub := CurrentHub()
+	hub.BindClient(mockClient)
+	ctx := SetHubOnContext(context.Background(), hub)
 	l := NewLogger(ctx)
 	for i := 0; i < 3; i++ {
 		l.Info().WithCtx(ctx).Emit("test")
 	}
 
-	hub := GetHubFromContext(ctx)
+	hub = GetHubFromContext(ctx)
 	hub.Client().batchLogger.Shutdown()
 
 	events := mockTransport.Events()
@@ -654,10 +664,8 @@ func Test_sentryLogger_TracePropagationWithTransaction(t *testing.T) {
 	if log.TraceID != expectedTraceID {
 		t.Errorf("unexpected TraceID: got %s, want %s", log.TraceID.String(), expectedTraceID.String())
 	}
-	if val, ok := log.Attributes["sentry.trace.parent_span_id"]; !ok {
-		t.Errorf("missing sentry.trace.parent_span_id attribute")
-	} else if val.Value != expectedSpanID.String() {
-		t.Errorf("unexpected SpanID: got %s, want %s", val.Value, expectedSpanID.String())
+	if log.SpanID != expectedSpanID {
+		t.Errorf("unexpected SpanID: got %s, want %s", log.SpanID.String(), expectedSpanID.String())
 	}
 }
 
@@ -693,8 +701,8 @@ func TestSentryLogger_DebugLogging(t *testing.T) {
 			hub.BindClient(mockClient)
 
 			// set the debug logger output after NewClient, so that it doesn't change.
-			DebugLogger.SetOutput(&buf)
-			defer DebugLogger.SetOutput(io.Discard)
+			debuglog.SetOutput(&buf)
+			defer debuglog.SetOutput(io.Discard)
 
 			logger := NewLogger(ctx)
 			logger.Info().WithCtx(ctx).Emit(tt.message)
